@@ -8,7 +8,7 @@ import (
 
 // UserAgent represents HTTP User-Agent header that should be added to requests to Selectel API.
 // You should add this header by yourself or use Headers function.
-const UserAgent = "external-dns-selectel-webhook"
+const UserAgent = "external-dns-selectel-private-webhook"
 
 const (
 	// httpTimeout represents the default timeout (in seconds) for HTTP requests.

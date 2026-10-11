@@ -2,110 +2,67 @@ package selprovider
 
 import (
 	"context"
+	"fmt"
 
-	domains "github.com/selectel/domains-go/pkg/v2"
+	privatedns "github.com/selectel/private-dns-go/pkg/v1"
+	"golang.org/x/sync/errgroup"
 	"sigs.k8s.io/external-dns/endpoint"
-	"sigs.k8s.io/external-dns/provider"
 )
 
-// Records returns resource records.
+// Records returns the record sets of all managed zones, including Auto record sets. external-dns needs to see Auto
+// record sets to avoid planning conflicting records; without an owner they are never planned for update or deletion.
 func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
-	client, err := p.getDomainsClient()
+	client, err := p.newClient()
 	if err != nil {
 		return nil, err
 	}
 
-	zones, err := p.zoneFetcherClient.zones(ctx, client)
+	zones, err := p.managedZones(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+
+	recordSets, err := p.listRecordSets(ctx, client, zones)
 	if err != nil {
 		return nil, err
 	}
 
 	var endpoints []*endpoint.Endpoint
-	endpointsErrorChannel := make(chan endpointError, len(zones))
-	zonesChan := make(chan string, len(zones))
 
-	for i := 0; i < p.workers; i++ {
-		go p.fetchRecordsWorker(ctx, client, zonesChan, endpointsErrorChannel)
-	}
-
-	for _, zone := range zones {
-		zonesChan <- zone.ID
-	}
-
-	for i := 0; i < len(zones); i++ {
-		endpointsErrorList := <-endpointsErrorChannel
-		if endpointsErrorList.err != nil {
-			close(zonesChan)
-
-			return nil, endpointsErrorList.err
-		}
-		endpoints = append(endpoints, endpointsErrorList.endpoints...)
-	}
-
-	close(zonesChan)
-
-	return endpoints, nil
-}
-
-// fetchRecordsWorker fetches all records from a given zone.
-func (p *Provider) fetchRecordsWorker(
-	ctx context.Context,
-	client domains.DNSClient[domains.Zone, domains.RRSet],
-	zonesChan chan string,
-	endpointsErrorChan chan<- endpointError,
-) {
-	for zoneID := range zonesChan {
-		p.processZoneRRSets(ctx, client, zoneID, endpointsErrorChan)
-	}
-
-	p.logger.Debug("fetch record set worker finished")
-}
-
-// processZoneRRSets fetches and processes DNS records for a given zone.
-func (p *Provider) processZoneRRSets(
-	ctx context.Context,
-	client domains.DNSClient[domains.Zone, domains.RRSet],
-	zoneID string,
-	endpointsErrorChannel chan<- endpointError,
-) {
-	var endpoints []*endpoint.Endpoint
-	rrSets, err := p.rrSetFetcherClient.fetchRecords(ctx, client, zoneID, map[string]string{})
-	if err != nil {
-		endpointsErrorChannel <- endpointError{
-			endpoints: nil,
-			err:       err,
-		}
-
-		return
-	}
-
-	endpoints = p.collectEndPoints(rrSets)
-	endpointsErrorChannel <- endpointError{
-		endpoints: endpoints,
-		err:       nil,
-	}
-}
-
-// collectEndPoints creates a list of Endpoints from the provided rrSets.
-func (p *Provider) collectEndPoints(
-	rrSets []*domains.RRSet,
-) []*endpoint.Endpoint {
-	var endpoints []*endpoint.Endpoint
-	for _, rrSet := range rrSets {
-		if provider.SupportedRecordType(string(rrSet.Type)) {
-			for _, rec := range rrSet.Records {
-				endpoints = append(
-					endpoints,
-					endpoint.NewEndpointWithTTL(
-						rrSet.Name,
-						string(rrSet.Type),
-						endpoint.TTL(rrSet.TTL),
-						rec.Content,
-					),
-				)
+	for _, records := range recordSets {
+		for _, record := range records {
+			if ep := endpointFromRecord(record); ep != nil {
+				endpoints = append(endpoints, ep)
 			}
 		}
 	}
 
-	return endpoints
+	return endpoints, nil
+}
+
+// listRecordSets fetches the record sets of the zones concurrently. The result is indexed like zones.
+func (p *Provider) listRecordSets(
+	ctx context.Context,
+	client *privatedns.PrivateDNSClient,
+	zones []*privatedns.Zone,
+) ([][]*privatedns.Record, error) {
+	result := make([][]*privatedns.Record, len(zones))
+
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(p.workers)
+
+	for i, zone := range zones {
+		group.Go(func() error {
+			records, err := client.ListRecords(groupCtx, zone.ID, nil)
+			if err != nil {
+				return fmt.Errorf("list record sets of zone %s: %w", zone.Domain, err)
+			}
+
+			result[i] = records
+
+			return nil
+		})
+	}
+
+	return result, group.Wait()
 }

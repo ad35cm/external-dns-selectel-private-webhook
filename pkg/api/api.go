@@ -2,62 +2,83 @@ package api
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/ad35cm/external-dns-selectel-private-webhook/pkg/metrics"
 	"github.com/goccy/go-json"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/helmet"
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/pprof"
 	fiberrecover "github.com/gofiber/fiber/v2/middleware/recover"
-	"github.com/selectel/external-dns-selectel-webhook/pkg/metrics"
 	"go.uber.org/zap"
 	"sigs.k8s.io/external-dns/provider"
 )
 
+const shutdownTimeout = 30 * time.Second
+
 type Api interface {
-	Listen(port string) error
+	// Listen serves the webhook API on webhookAddress and the health and metrics endpoints on healthAddress
+	// until a termination signal arrives or one of the servers fails.
+	Listen(webhookAddress, healthAddress string) error
+	// Test sends a request to the webhook API.
 	Test(req *http.Request, msTimeout ...int) (resp *http.Response, err error)
+	// TestHealth sends a request to the health and metrics server.
+	TestHealth(req *http.Request, msTimeout ...int) (resp *http.Response, err error)
 }
 
 type api struct {
-	logger *zap.Logger
-	app    *fiber.App
+	logger  *zap.Logger
+	webhook *fiber.App
+	health  *fiber.App
 }
 
 func (a api) Test(req *http.Request, msTimeout ...int) (resp *http.Response, err error) {
-	return a.app.Test(req, msTimeout...)
+	return a.webhook.Test(req, msTimeout...)
 }
 
-func (a api) Listen(port string) error {
-	go func() {
-		err := a.app.Listen(fmt.Sprintf(":%s", port))
-		if err != nil {
-			a.logger.Fatal("Error starting the server", zap.String(logFieldError, err.Error()))
-		}
-	}()
+func (a api) TestHealth(req *http.Request, msTimeout ...int) (resp *http.Response, err error) {
+	return a.health.Test(req, msTimeout...)
+}
 
+func (a api) Listen(webhookAddress, healthAddress string) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	sig := <-sigCh
+	defer signal.Stop(sigCh)
 
-	a.logger.Info(
-		"shutting down server due to received signal",
-		zap.String("signal", sig.String()),
-	)
+	serveErr := make(chan error, 2)
+	serve := func(app *fiber.App, name, address string) {
+		a.logger.Info("starting server", zap.String("server", name), zap.String("address", address))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	err := a.app.ShutdownWithContext(ctx)
-	if err != nil {
-		a.logger.Error("error shutting down server", zap.String("err", err.Error()))
+		if err := app.Listen(address); err != nil {
+			serveErr <- errors.Join(errors.New(name+" server stopped"), err)
+		}
 	}
 
-	cancel()
+	go serve(a.health, "health", healthAddress)
+	go serve(a.webhook, "webhook", webhookAddress)
+
+	var stopErr error
+
+	select {
+	case sig := <-sigCh:
+		a.logger.Info("shutting down servers due to received signal", zap.String("signal", sig.String()))
+	case stopErr = <-serveErr:
+		a.logger.Error("shutting down servers due to server failure", zap.Error(stopErr))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	err := errors.Join(stopErr, a.webhook.ShutdownWithContext(ctx), a.health.ShutdownWithContext(ctx))
+	if err != nil {
+		a.logger.Error("error shutting down servers", zap.Error(err))
+	}
 
 	return err
 }
@@ -67,16 +88,22 @@ type Provider interface {
 	provider.Provider
 }
 
-func New(logger *zap.Logger, middlewareCollector metrics.HttpApiMetrics, provider provider.Provider) Api {
-	app := fiber.New(fiber.Config{
+func newApp() *fiber.App {
+	return fiber.New(fiber.Config{
 		DisableStartupMessage: true,
 		JSONEncoder:           json.Marshal,
 		JSONDecoder:           json.Unmarshal,
 	})
+}
 
-	registerAt(app, "/metrics")
-	app.Get("/healthz", Health)
+// New returns the webhook API, which external-dns calls, and a separate health and metrics server for probes and
+// scraping. Keeping them apart allows the webhook API to listen on localhost only.
+func New(logger *zap.Logger, middlewareCollector metrics.HttpApiMetrics, provider provider.Provider) Api {
+	health := newApp()
+	registerAt(health, "/metrics")
+	health.Get("/healthz", Health)
 
+	app := newApp()
 	app.Use(NewMetricsMiddleware(middlewareCollector))
 	app.Use(fiberlogger.New())
 	app.Use(pprof.New(pprof.Config{Prefix: "/pprof"}))
@@ -94,7 +121,8 @@ func New(logger *zap.Logger, middlewareCollector metrics.HttpApiMetrics, provide
 	app.Post("/adjustendpoints", webhookRoutes.AdjustEndpoints)
 
 	return &api{
-		logger: logger,
-		app:    app,
+		logger:  logger,
+		webhook: app,
+		health:  health,
 	}
 }

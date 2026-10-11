@@ -1,260 +1,158 @@
-# Selectel Webhook - ExternalDNS
+# ExternalDNS webhook for Selectel Private DNS
 
-[![GoTemplate](https://img.shields.io/badge/go/template-black?logo=go)](https://github.com/golang-standards/project-layout)
-[![CI](https://github.com/selectel/external-dns-selectel-webhook/actions/workflows/main.yml/badge.svg)](https://github.com/selectel/external-dns-selectel-webhook/actions/workflows/main.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/selectel/external-dns-selectel-webhook)](https://goreportcard.com/report/github.com/selectel/external-dns-selectel-webhook)
-[![GitHub release](https://img.shields.io/github/release/selectel/external-dns-selectel-webhook.svg)](https://github.com/selectel/external-dns-selectel-webhook/releases)
-[![Last Commit](https://img.shields.io/github/last-commit/selectel/external-dns-selectel-webhook/main.svg)](https://github.com/selectel/external-dns-selectel-webhook/commits/main)
-[![GitHub issues](https://img.shields.io/github/issues/selectel/external-dns-selectel-webhook.svg)](https://github.com/selectel/external-dns-selectel-webhook/issues)
-[![GitHub pull requests](https://img.shields.io/github/issues-pr/selectel/external-dns-selectel-webhook.svg)](https://github.com/selectel/external-dns-selectel-webhook/pulls)
-[![GitHub stars](https://img.shields.io/github/stars/selectel/external-dns-selectel-webhook.svg?style=social&label=Star&maxAge=2592000)](https://github.com/selectel/external-dns-selectel-webhook/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/selectel/external-dns-selectel-webhook.svg?style=social&label=Fork&maxAge=2592000)](https://github.com/selectel/external-dns-selectel-webhook/network)
+An [ExternalDNS webhook provider](https://github.com/kubernetes-sigs/external-dns/blob/master/docs/tutorials/webhook-provider.md)
+for [Selectel Private DNS](https://docs.selectel.ru/en/cloud-servers/private-dns/), the DNS service for zones that resolve
+only inside Selectel private networks. It manages the record sets of private zones in one pool through the
+[Private DNS API](https://docs.selectel.ru/en/api/private-dns/).
 
-ExternalDNS serves as an add-on for Kubernetes designed to automate the management of Domain Name System (DNS)
-records for Kubernetes services by utilizing various DNS providers. While Kubernetes traditionally manages DNS
-records internally, ExternalDNS augments this functionality by transferring the responsibility of DNS records
-management to an external DNS provider such as Selectel. Consequently, the Selectel webhook enables the management
-of your Selectel domains within your Kubernetes cluster using
-[ExternalDNS](https://github.com/kubernetes-sigs/external-dns).
+This project is a fork of [selectel/external-dns-selectel-webhook](https://github.com/selectel/external-dns-selectel-webhook),
+which supports only the public DNS hosting API. The webhook server, Keystone authentication, flag and environment
+configuration, domain filter and metrics are kept; the DNS backend is replaced. See [NOTICE](NOTICE) for attribution.
 
-For utilizing ExternalDNS with Selectel, it is mandatory to establish a Selectel project, a service account
-within the project, and finally, establish a domain zone.
+## How it works
 
-## Kubernetes Deployment
+- **Zones.** The webhook lists the private zones of the project in the configured pool. Zones that do not match
+  `--domain-filter` and zones reserved by another Selectel service (for example Managed Databases) are not managed.
+- **Records.** A, AAAA, CNAME, MX and TXT are supported. One ExternalDNS endpoint maps to one record set (name and type);
+  its targets are the record set values. An endpoint without a TTL creates a record set that inherits the zone TTL.
+- **Changes.** Every sync sends one hard update (`PUT /zones/{zone_id}/recordset`) per changed zone. The API applies it
+  atomically, deletions first, so a record can change type (for example CNAME to A) in one sync.
+- **Auto records.** When a private network is added to a zone, Private DNS creates A/AAAA records for its ports and marks
+  them `generated` (Auto in the control panel). The webhook reports them to ExternalDNS, which treats them as records it
+  does not own, and never modifies or deletes them: any change to an Auto record set, or a CNAME at its name, is dropped
+  with a `skipping change to an Auto record set` warning.
+- **Limits** enforced by the API: 1,000 record sets per zone, 100 values per record set, one value per CNAME, and the
+  exchange host of an MX record must be inside the zone.
+- **Ports.** The webhook API listens on `127.0.0.1:8888`, reachable only from the ExternalDNS container of the same pod.
+  `/healthz` and `/metrics` listen on `:8080`, the `http-webhook` port that the ExternalDNS Helm chart probes.
 
-The Selectel webhook is presented as a standard Open Container Initiative (OCI) image released in the
-[GitHub container registry](https://github.com/selectel/external-dns-selectel-webhook/pkgs/container/external-dns-selectel-webhook).
-The deployment is compatible with all Kubernetes-supported methods. The subsequent example
-demonstrates the deployment as a
-[sidecar container](https://kubernetes.io/docs/concepts/workloads/pods/#workload-resources-for-managing-pods)
-within the ExternalDNS pod.
+## Prerequisites
 
-```shell 
-kubectl create secret generic external-dns-selectel-webhook --from-literal=password='<Service-User-Password>'
-```
+1. A private zone in the pool, for example `prod-ru-6.burnsdev.com.` in `ru-6`.
+2. A [service user](https://docs.selectel.ru/en/access-control/user-types/#service-users) with the
+   `vpc.private_network.admin` role (or `member`) in the project that owns the zone. The webhook authenticates with a
+   project-scoped Keystone token issued for this user.
+3. The account ID (the `OS_PROJECT_DOMAIN_NAME` value of the project's `rc.sh`) and the project ID.
+
+## Kubernetes deployment
+
+The image is published as `ghcr.io/ad35cm/external-dns-selectel-private-webhook:<version>` for `linux/amd64` and
+`linux/arm64`. Run it as the `provider.webhook` sidecar of the
+[external-dns Helm chart](https://github.com/kubernetes-sigs/external-dns/tree/master/charts/external-dns) (tested with
+chart 1.23.0, ExternalDNS v0.23.0).
+
+Create the Secret with the service-user credentials:
 
 ```shell
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: external-dns
-  namespace: default
-  labels:
-    app.kubernetes.io/name: external-dns
-    app.kubernetes.io/instance: external-dns
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: external-dns
-  labels:
-    app.kubernetes.io/name: external-dns
-    app.kubernetes.io/instance: external-dns
-rules:
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["list","watch"]
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get","watch","list"]
-  - apiGroups: [""]
-    resources: ["services","endpoints"]
-    verbs: ["get","watch","list"]
-  - apiGroups: ["extensions","networking.k8s.io"]
-    resources: ["ingresses"]
-    verbs: ["get","watch","list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: external-dns-viewer
-  labels:
-    app.kubernetes.io/name: external-dns
-    app.kubernetes.io/instance: external-dns
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: external-dns
-subjects:
-  - kind: ServiceAccount
-    name: external-dns
-    namespace: default
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: external-dns
-  namespace: default
-  labels:
-    app.kubernetes.io/name: external-dns
-    app.kubernetes.io/instance: external-dns
-spec:
-  type: ClusterIP
-  selector:
-    app.kubernetes.io/name: external-dns
-    app.kubernetes.io/instance: external-dns
-  ports:
-    - name: http
-      port: 7979
-      targetPort: http
-      protocol: TCP
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: external-dns
-  namespace: default
-  labels:
-    app.kubernetes.io/name: external-dns
-    app.kubernetes.io/instance: external-dns
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: external-dns
-      app.kubernetes.io/instance: external-dns
-  strategy:
-    type: Recreate
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: external-dns
-        app.kubernetes.io/instance: external-dns
-    spec:
-      serviceAccountName: external-dns
-      securityContext:
-        fsGroup: 65534
-      containers:
-        - name: external-dns
-          securityContext:
-            capabilities:
-              drop:
-              - ALL
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65534
-          image: registry.k8s.io/external-dns/external-dns:v0.14.0
-          imagePullPolicy: IfNotPresent
-          args:
-            - --log-level=info
-            - --log-format=text
-            - --interval=1m
-            - --source=service
-            - --source=ingress
-            - --policy=sync # set it upsert-only if you don't want it to delete records
-            - --provider=webhook
-          ports:
-            - name: http
-              protocol: TCP
-              containerPort: 7979
-          livenessProbe:
-            failureThreshold: 2
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            successThreshold: 1
-            timeoutSeconds: 5
-          readinessProbe:
-            failureThreshold: 6
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            successThreshold: 1
-            timeoutSeconds: 5
-        - name: webhook
-          securityContext:
-            capabilities:
-              drop:
-                - ALL
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65534
-          image: ghcr.io/selectel/external-dns-selectel-webhook:v0.1.0
-          imagePullPolicy: IfNotPresent
-          args:
-            - --project-id=4027de78158a410fb7c64c65af940f96 # your project id
-            - --account-id=000000 # your account id
-            - --username=Username # your service user's name
-          ports:
-            - name: http
-              protocol: TCP
-              containerPort: 8888
-          livenessProbe:
-            failureThreshold: 2
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            successThreshold: 1
-            timeoutSeconds: 5
-          readinessProbe:
-            failureThreshold: 6
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            successThreshold: 1
-            timeoutSeconds: 5
-          env:
-            - name: PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: external-dns-selectel-webhook
-                  key: password
-EOF
+kubectl create namespace external-dns
+kubectl create secret generic external-dns-selectel-private \
+  --namespace external-dns \
+  --from-literal=account-id='<account id>' \
+  --from-literal=project-id='<project id>' \
+  --from-literal=username='<service user name>' \
+  --from-literal=password='<service user password>'
 ```
+
+| Secret key   | Environment variable | Content                    |
+|--------------|----------------------|----------------------------|
+| `account-id` | `ACCOUNT_ID`         | Selectel account ID        |
+| `project-id` | `PROJECT_ID`         | ID of the zone's project   |
+| `username`   | `USERNAME`           | Service user name          |
+| `password`   | `PASSWORD`           | Service user password      |
+
+Helm values:
+
+```yaml
+provider:
+  name: webhook
+  webhook:
+    image:
+      repository: ghcr.io/ad35cm/external-dns-selectel-private-webhook
+      tag: 1.0.0
+    args:
+      - --pool=ru-6
+      - --domain-filter=prod-ru-6.burnsdev.com
+    env:
+      - name: ACCOUNT_ID
+        valueFrom:
+          secretKeyRef:
+            name: external-dns-selectel-private
+            key: account-id
+      - name: PROJECT_ID
+        valueFrom:
+          secretKeyRef:
+            name: external-dns-selectel-private
+            key: project-id
+      - name: USERNAME
+        valueFrom:
+          secretKeyRef:
+            name: external-dns-selectel-private
+            key: username
+      - name: PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: external-dns-selectel-private
+            key: password
+    securityContext:
+      runAsNonRoot: true
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+
+domainFilters:
+  - prod-ru-6.burnsdev.com
+policy: sync
+registry: txt
+txtOwnerId: prod-ru-6-selectel
+sources:
+  - service
+  - ingress
+```
+
+The chart's default probes (`/healthz` on the `http-webhook` port) and webhook service port (8080) work unchanged.
+Set `provider.webhook.serviceMonitor` to scrape the webhook's `/metrics`.
 
 ## Configuration
 
-The configuration of the Selectel webhook can be accomplished through command line arguments and environment variables.
-Below are the options that are available in format `--cli-argument`/`ENVIRONMENT_VARIABLE`.
+Every flag can also be set through the environment variable in the second column. Command-line flags take precedence.
 
-- `--project-id`/`PROJECT_ID` (required): Specifies the project id to authorize.
-- `--account-id`/`ACCOUNT_ID` (required): Specifies the account id to authorize.
-- `--username`/`USERNAME` (required): Specifies the username of your service user to authorize.
-- `--password`/`PASSWORD` (required): Specifies the password of your service user to authorize.
-- `--worker`/`WORKER`  (optional): Specifies the number of workers to employ for querying the API. Given that we
-  need to iterate over all zones and records, it can be parallelized. However, it is important to avoid
-  setting this number excessively high to prevent receiving 429 rate limiting from the API (default 10).
-- `--base-url`/`BASE_URL` (optional): Identifies the Base URL for utilizing the API
-  (default "https://api.selectel.ru/domains/v2"). The full list of Selectel API URLs you can
-  see [here](https://developers.selectel.ru/docs/control-panel/urls/).
-- `--auth-url`/`AUTH_URL` (optional): Identifies the URL for utilizing the API to receive keystone-token
-  (default "https://cloud.api.selcloud.ru/identity/v3").
-- `--api-port`/`API_PORT` (optional): Specifies the port to listen on (default 8888).
-- `--domain-filter`/`DOMAIN_FILER` (optional): Establishes a filter for DNS zone names (default []).
-- `--dry-run`/`DRY_RUN` (optional): Specifies whether to perform a dry run (default false).
-- `--log-level`/`LOG_LEVEL` (optional): Defines the log level (default "info"). Possible values are: debug, info, warn,
-  error.
+| Flag              | Environment variable | Default                                    | Description |
+|-------------------|----------------------|--------------------------------------------|-------------|
+| `--pool`          | `POOL`               |                                            | Selectel pool of the zones, e.g. `ru-6`. The API endpoint is `https://<pool>.cloud.api.selcloud.ru/private-dns/v1`. Required unless `--base-url` is set. |
+| `--base-url`      | `BASE_URL`           |                                            | Private DNS API endpoint; overrides `--pool`. |
+| `--project-id`    | `PROJECT_ID`         |                                            | Required. Project of the zones; the Keystone token is scoped to it. |
+| `--account-id`    | `ACCOUNT_ID`         |                                            | Required. Selectel account ID (Keystone domain). |
+| `--username`      | `USERNAME`           |                                            | Required. Service user name. |
+| `--password`      | `PASSWORD`           |                                            | Required. Service user password. |
+| `--auth-url`      | `AUTH_URL`           | `https://cloud.api.selcloud.ru/identity/v3` | Keystone endpoint. |
+| `--domain-filter` | `DOMAIN_FILTER`      | all zones                                  | Zones to manage. Repeat the flag or separate domains with commas. ExternalDNS also receives this filter. |
+| `--api-port`      | `API_PORT`           | `8888`                                     | Port of the webhook API on `127.0.0.1`. |
+| `--health-port`   | `HEALTH_PORT`        | `8080`                                     | Port of `/healthz` and `/metrics` on all interfaces. |
+| `--worker`        | `WORKER`             | `10`                                       | Zones processed concurrently. Keep it low to avoid 429 responses from the API. |
+| `--dry-run`       | `DRY_RUN`            | `false`                                    | Log the record set changes instead of applying them. |
+| `--log-level`     | `LOG_LEVEL`          | `info`                                     | `debug`, `info`, `warn` or `error`. |
+
+The webhook exits at startup if `--pool`/`--base-url` or any credential is missing.
 
 ## Development
 
-Run the app:
-
-```bash
-export PROJECT_ID="c158c736-0300-4044-95c4-b7d404279b35"
-export ACCOUNT_ID="123456"
-export USERNAME="username"
-export PASSWORD ="password"
-
-make run
+```shell
+make build   # bin/external-dns-selectel-private-webhook
+make test    # unit tests against an in-memory Private DNS API
+make lint    # golangci-lint v2
 ```
 
-Lint the code:
+Run against a real pool, with the credentials in the environment:
 
-```bash
-make lint
+```shell
+export ACCOUNT_ID=... PROJECT_ID=... USERNAME=... PASSWORD=...
+./bin/external-dns-selectel-private-webhook --pool=ru-6 --domain-filter=example.internal --log-level=debug
+curl -s localhost:8888/records
 ```
 
-Test the code:
+## Release
 
-```bash
-make test
-```
+Pushing a `v*` tag runs [the workflow](.github/workflows/go.yml): lint, build and test, then GoReleaser publishes the
+GitHub release and the images `ghcr.io/ad35cm/external-dns-selectel-private-webhook:<version>` (multi-arch manifest),
+`:<version>-amd64` and `:<version>-arm64`. `make release-check` builds the same artifacts locally without publishing.

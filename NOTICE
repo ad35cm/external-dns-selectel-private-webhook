@@ -12,6 +12,11 @@ with Selectel DNS API. All these files are located in the directories:
 
 Other modifications were made due to repository and packages renaming and changes in documentation to accommodate Selectel DNS API.
 
+This product is a fork of https://github.com/selectel/external-dns-selectel-webhook, modified by ad35cm
+(https://github.com/ad35cm) in 2026 to manage Selectel Private DNS zones through the Private DNS API instead of the
+public DNS hosting API. The DNS backend in /internal/selprovider/ was rewritten; /cmd/, /pkg/api/, /pkg/httpdefault/,
+/pkg/metrics/, the build, release and CI configuration and the documentation were modified, and the module was renamed to
+github.com/ad35cm/external-dns-selectel-private-webhook.
+
 This modified software is distributed under the terms of the Apache License, Version 2.0. 
 The full text of the license may be found at https://www.apache.org/licenses/LICENSE-2.0.
-

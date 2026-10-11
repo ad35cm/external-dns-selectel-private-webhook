@@ -6,15 +6,15 @@ import (
 
 // Config is used to configure the creation of the Provider.
 type Config struct {
-	// BaseURL is a Selectel DNS API endpoint for v2.DNSClient
+	// BaseURL is the Private DNS API endpoint of a pool, e.g. https://ru-6.cloud.api.selcloud.ru/private-dns/v1.
 	BaseURL string
-	// KeystoneProvider needed to generate X-Auth-Token header with keystone-header for requests to the DNS API.
+	// KeystoneProvider issues the project-scoped Keystone token sent in the X-Auth-Token header.
 	KeystoneProvider KeystoneProvider
-	// DomainFilter is a list with domains that will be affected. If it is empty all available domains will be affected.
-	DomainFilter endpoint.DomainFilter
-	// DryRun is a flag specifies user's wish to run without requests to the DNS API
+	// DomainFilter limits the managed zones. A nil or empty filter matches every zone of the project.
+	DomainFilter *endpoint.DomainFilter
+	// DryRun logs the changes instead of sending them to the API.
 	DryRun bool
-	// Workers is a number of goroutines that will create requests to the DNS API.
+	// Workers is the number of zones processed concurrently.
 	Workers int
 }
 

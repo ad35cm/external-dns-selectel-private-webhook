@@ -3,9 +3,9 @@ package keystone
 import (
 	"fmt"
 
+	"github.com/ad35cm/external-dns-selectel-private-webhook/pkg/httpdefault"
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
-	"github.com/selectel/external-dns-selectel-webhook/pkg/httpdefault"
 	"go.uber.org/zap"
 )
 

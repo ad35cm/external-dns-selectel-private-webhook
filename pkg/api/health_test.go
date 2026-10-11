@@ -5,9 +5,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/ad35cm/external-dns-selectel-private-webhook/pkg/api"
+	mock_provider "github.com/ad35cm/external-dns-selectel-private-webhook/pkg/api/mock"
 	"github.com/gofiber/fiber/v2"
-	"github.com/selectel/external-dns-selectel-webhook/pkg/api"
-	mock_provider "github.com/selectel/external-dns-selectel-webhook/pkg/api/mock"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 	"go.uber.org/zap"
@@ -27,7 +27,7 @@ func TestHealth(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	req.Header.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
 
-	resp, err := app.Test(req, -1)
+	resp, err := app.TestHealth(req, -1)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }

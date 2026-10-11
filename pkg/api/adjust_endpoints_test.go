@@ -6,15 +6,14 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/ad35cm/external-dns-selectel-private-webhook/pkg/api"
+	mock_provider "github.com/ad35cm/external-dns-selectel-private-webhook/pkg/api/mock"
 	"github.com/goccy/go-json"
 	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 	"go.uber.org/zap"
 	"sigs.k8s.io/external-dns/endpoint"
-
-	"github.com/selectel/external-dns-selectel-webhook/pkg/api"
-	mock_provider "github.com/selectel/external-dns-selectel-webhook/pkg/api/mock"
 )
 
 func TestWebhook_AdjustEndpoints(t *testing.T) {

@@ -4,249 +4,152 @@ import (
 	"context"
 	"fmt"
 
-	domains "github.com/selectel/domains-go/pkg/v2"
+	privatedns "github.com/selectel/private-dns-go/pkg/v1"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/plan"
 )
 
-// ApplyChanges applies a given set of changes.
+// recordChange is a single endpoint change routed to a zone.
+type recordChange struct {
+	action   string
+	endpoint *endpoint.Endpoint
+}
+
+// zoneChanges collects the changes of one zone. They are sent in one atomic hard update (PUT) request.
+type zoneChanges struct {
+	zone    *privatedns.Zone
+	changes []recordChange
+}
+
+// ApplyChanges applies a given set of changes. Each zone receives one hard update request that replaces the record
+// sets of created and updated endpoints and deletes the record sets of deleted endpoints. Changes that touch Auto
+// record sets are skipped.
 func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
-	client, err := p.getDomainsClient()
-	if err != nil {
-		return err
-	}
-
-	// create rr set. POST /zones/{zoneId}/rrset
-	err = p.createRRSets(ctx, client, changes.Create)
-	if err != nil {
-		return err
-	}
-
-	// update rr set. PATCH /zones/{zoneId}/rrset/{rrSetId}
-	err = p.updateRRSets(ctx, client, changes.UpdateNew)
-	if err != nil {
-		return err
-	}
-
-	// delete rr set. DELETE /zones/{zoneId}/rrset/{rrSetId}
-	err = p.deleteRRSets(ctx, client, changes.Delete)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// createRRSets creates new record sets for the given endpoints that are in the creation field.
-func (p *Provider) createRRSets(
-	ctx context.Context,
-	client domains.DNSClient[domains.Zone, domains.RRSet],
-	endpoints []*endpoint.Endpoint,
-) error {
-	if len(endpoints) == 0 {
+	if changes == nil || len(changes.Create)+len(changes.UpdateNew)+len(changes.Delete) == 0 {
 		return nil
 	}
 
-	return p.handleRRSetWithWorkers(ctx, client, endpoints, CREATE)
-}
-
-// updateRRSets patches (overrides) contents in the record sets for the given endpoints that are in the update new field.
-func (p *Provider) updateRRSets(
-	ctx context.Context,
-	client domains.DNSClient[domains.Zone, domains.RRSet],
-	endpoints []*endpoint.Endpoint,
-) error {
-	if len(endpoints) == 0 {
-		return nil
-	}
-
-	return p.handleRRSetWithWorkers(ctx, client, endpoints, UPDATE)
-}
-
-// deleteRRSets delete record sets for the given endpoints that are in the deletion field.
-func (p *Provider) deleteRRSets(
-	ctx context.Context,
-	client domains.DNSClient[domains.Zone, domains.RRSet],
-	endpoints []*endpoint.Endpoint,
-) error {
-	if len(endpoints) == 0 {
-		return nil
-	}
-
-	p.logger.Info("records to delete", zap.String("records", fmt.Sprintf("%v", endpoints)))
-
-	return p.handleRRSetWithWorkers(ctx, client, endpoints, DELETE)
-}
-
-// handleRRSetWithWorkers handles the given endpoints with workers to optimize speed.
-func (p *Provider) handleRRSetWithWorkers(
-	ctx context.Context,
-	client domains.DNSClient[domains.Zone, domains.RRSet],
-	endpoints []*endpoint.Endpoint,
-	action string,
-) error {
-	zones, err := p.zoneFetcherClient.zones(ctx, client)
+	client, err := p.newClient()
 	if err != nil {
 		return err
 	}
 
-	workerChannel := make(chan changeTask, len(endpoints))
-	defer close(workerChannel)
-	errorChannel := make(chan error, len(endpoints))
-
-	for i := 0; i < p.workers; i++ {
-		go p.changeWorker(ctx, client, workerChannel, errorChannel, zones)
+	zones, err := p.managedZones(ctx, client)
+	if err != nil {
+		return err
 	}
 
-	for _, change := range endpoints {
-		workerChannel <- changeTask{
-			action: action,
-			change: change,
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(p.workers)
+
+	for _, batch := range p.groupByZone(changes, zones) {
+		group.Go(func() error {
+			return p.applyZoneChanges(groupCtx, client, batch)
+		})
+	}
+
+	return group.Wait()
+}
+
+// groupByZone routes every change to the managed zone with the longest matching domain. Changes outside all managed
+// zones are skipped with a warning, like other external-dns providers do.
+func (p *Provider) groupByZone(changes *plan.Changes, zones []*privatedns.Zone) []*zoneChanges {
+	byZoneID := map[string]*zoneChanges{}
+
+	var batches []*zoneChanges
+
+	add := func(action string, endpoints []*endpoint.Endpoint) {
+		for _, ep := range endpoints {
+			zone := zoneForName(ep.DNSName, zones)
+			if zone == nil {
+				p.logger.Warn("skipping change outside of all managed zones", getLogFields(ep, action, "")...)
+
+				continue
+			}
+
+			batch, ok := byZoneID[zone.ID]
+			if !ok {
+				batch = &zoneChanges{zone: zone}
+				byZoneID[zone.ID] = batch
+				batches = append(batches, batch)
+			}
+
+			batch.changes = append(batch.changes, recordChange{action: action, endpoint: ep})
 		}
 	}
 
-	for i := 0; i < len(endpoints); i++ {
-		err := <-errorChannel
-		if err != nil {
-			return err
+	add(actionCreate, changes.Create)
+	add(actionUpdate, changes.UpdateNew)
+	add(actionDelete, changes.Delete)
+
+	return batches
+}
+
+// applyZoneChanges sends the changes of one zone in a single hard update request. The current record sets are read
+// first so that changes to Auto record sets are dropped before the request is built.
+func (p *Provider) applyZoneChanges(ctx context.Context, client *privatedns.PrivateDNSClient, batch *zoneChanges) error {
+	current, err := client.ListRecords(ctx, batch.zone.ID, nil)
+	if err != nil {
+		return fmt.Errorf("list record sets of zone %s: %w", batch.zone.Domain, err)
+	}
+
+	request := p.buildRequest(batch, newAutoRecords(current))
+	if len(request.Set) == 0 && len(request.Delete) == 0 {
+		return nil
+	}
+
+	zoneFields := []zap.Field{
+		zap.String("zone", batch.zone.Domain),
+		zap.Int("set", len(request.Set)),
+		zap.Int("delete", len(request.Delete)),
+	}
+
+	if p.dryRun {
+		p.logger.Info("dry run, skipping record sets update", zoneFields...)
+
+		return nil
+	}
+
+	if _, err := client.PutRecords(ctx, batch.zone.ID, request); err != nil {
+		p.logger.Error("error updating record sets", append(zoneFields, zap.Error(err))...)
+
+		return fmt.Errorf("update record sets of zone %s: %w", batch.zone.Domain, err)
+	}
+
+	p.logger.Info("record sets updated", zoneFields...)
+
+	return nil
+}
+
+// buildRequest converts the changes of a zone into a hard update request, dropping changes to Auto record sets.
+func (p *Provider) buildRequest(batch *zoneChanges, auto autoRecords) *privatedns.PutRecordsDTO {
+	request := &privatedns.PutRecordsDTO{}
+
+	for _, change := range batch.changes {
+		logFields := getLogFields(change.endpoint, change.action, batch.zone.Domain)
+
+		if autoType, found := auto.conflict(change.action, change.endpoint); found {
+			p.logger.Warn(
+				"skipping change to an Auto record set managed by a network bound to the zone",
+				append(logFields, zap.String("auto_record_type", autoType))...,
+			)
+
+			continue
+		}
+
+		p.logger.Info("record set change", logFields...)
+
+		if change.action == actionDelete {
+			request.Delete = append(request.Delete, &privatedns.RecordDeleteDTO{
+				Type:   change.endpoint.RecordType,
+				Domain: canonicalName(change.endpoint.DNSName),
+			})
+		} else {
+			request.Set = append(request.Set, recordSetFromEndpoint(change.endpoint))
 		}
 	}
 
-	return nil
-}
-
-// createRRSet creates a new record set for the given endpoint.
-func (p *Provider) createRRSet(
-	ctx context.Context,
-	client domains.DNSClient[domains.Zone, domains.RRSet],
-	change *endpoint.Endpoint,
-	zones []*domains.Zone,
-) error {
-	resultZone, found := findBestMatchingZone(change.DNSName, zones)
-	if !found {
-		return fmt.Errorf("no matching zone found for %s", change.DNSName)
-	}
-
-	logFields := getLogFields(change, CREATE, resultZone.ID)
-	p.logger.Info("create record set", logFields...)
-
-	if p.dryRun {
-		p.logger.Debug("dry run, skipping", logFields...)
-
-		return nil
-	}
-
-	modifyChange(change)
-
-	rrSet := getRRSetRecord(change)
-
-	// ignore all errors to just retry on next run
-	_, err := client.CreateRRSet(ctx, resultZone.ID, rrSet)
-	if err != nil {
-		p.logger.Error("error creating record set", zap.Error(err))
-
-		return err
-	}
-
-	p.logger.Info("create record set successfully", logFields...)
-
-	return nil
-}
-
-// updateRRSet patches (overrides) contents in the record set.
-func (p *Provider) updateRRSet(
-	ctx context.Context,
-	client domains.DNSClient[domains.Zone, domains.RRSet],
-	change *endpoint.Endpoint,
-	zones []*domains.Zone,
-) error {
-	modifyChange(change)
-
-	resultZone, resultRRSet, err := p.rrSetFetcherClient.getRRSetForUpdateDeletion(ctx, client, change, zones)
-	if err != nil {
-		return err
-	}
-
-	logFields := getLogFields(change, UPDATE, resultRRSet.ID)
-	p.logger.Info("update record set", logFields...)
-
-	if p.dryRun {
-		p.logger.Debug("dry run, skipping", logFields...)
-
-		return nil
-	}
-
-	rrSet := getRRSetRecord(change)
-
-	err = client.UpdateRRSet(ctx, resultZone.ID, resultRRSet.ID, rrSet)
-	if err != nil {
-		p.logger.Error("error updating record set", zap.Error(err))
-
-		return err
-	}
-
-	p.logger.Info("record set updated successfully", logFields...)
-
-	return nil
-}
-
-// deleteRRSet deletes a record set for the given endpoint.
-func (p *Provider) deleteRRSet(
-	ctx context.Context,
-	client domains.DNSClient[domains.Zone, domains.RRSet],
-	change *endpoint.Endpoint,
-	zones []*domains.Zone,
-) error {
-	modifyChange(change)
-
-	resultZone, resultRRSet, err := p.rrSetFetcherClient.getRRSetForUpdateDeletion(ctx, client, change, zones)
-	if err != nil {
-		return err
-	}
-
-	logFields := getLogFields(change, DELETE, resultRRSet.ID)
-	p.logger.Info("delete record set", logFields...)
-
-	if p.dryRun {
-		p.logger.Debug("dry run, skipping", logFields...)
-
-		return nil
-	}
-
-	err = client.DeleteRRSet(ctx, resultZone.ID, resultRRSet.ID)
-	if err != nil {
-		p.logger.Error("error deleting record set", zap.Error(err))
-
-		return err
-	}
-
-	p.logger.Info("delete record set successfully", logFields...)
-
-	return nil
-}
-
-// changeWorker is a worker that handles changes passed by a channel.
-func (p *Provider) changeWorker(
-	ctx context.Context,
-	client domains.DNSClient[domains.Zone, domains.RRSet],
-	changes chan changeTask,
-	errorChannel chan error,
-	zones []*domains.Zone,
-) {
-	for change := range changes {
-		switch change.action {
-		case CREATE:
-			err := p.createRRSet(ctx, client, change.change, zones)
-			errorChannel <- err
-		case UPDATE:
-			err := p.updateRRSet(ctx, client, change.change, zones)
-			errorChannel <- err
-		case DELETE:
-			err := p.deleteRRSet(ctx, client, change.change, zones)
-			errorChannel <- err
-		}
-	}
-
-	p.logger.Debug("change worker finished")
+	return request
 }

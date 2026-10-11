@@ -5,10 +5,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/ad35cm/external-dns-selectel-private-webhook/pkg/api"
+	metrics_collector "github.com/ad35cm/external-dns-selectel-private-webhook/pkg/metrics"
+	mock_metrics_collector "github.com/ad35cm/external-dns-selectel-private-webhook/pkg/metrics/mock"
 	"github.com/gofiber/fiber/v2"
-	"github.com/selectel/external-dns-selectel-webhook/pkg/api"
-	metrics_collector "github.com/selectel/external-dns-selectel-webhook/pkg/metrics"
-	mock_metrics_collector "github.com/selectel/external-dns-selectel-webhook/pkg/metrics/mock"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 )

@@ -1,269 +1,112 @@
 package selprovider
 
 import (
-	"context"
-	"fmt"
+	"errors"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 
-	"github.com/goccy/go-json"
-	domains "github.com/selectel/domains-go/pkg/v2"
-	mock_selprovider "github.com/selectel/external-dns-selectel-webhook/internal/selprovider/mock"
+	mock_selprovider "github.com/ad35cm/external-dns-selectel-private-webhook/internal/selprovider/mock"
+	privatedns "github.com/selectel/private-dns-go/pkg/v1"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 	"go.uber.org/zap"
 	"sigs.k8s.io/external-dns/endpoint"
 )
 
+func recordsTestAPI(t *testing.T) *fakeAPI {
+	t.Helper()
+
+	return newFakeAPI(t,
+		[]*privatedns.Zone{
+			{ID: "prod", Domain: "prod.example.com.", TTL: 3600},
+			{ID: "dbaas", Domain: "db.example.com.", ReservedBy: "dbaas"},
+			{ID: "other", Domain: "example.org."},
+		},
+		map[string][]*privatedns.Record{
+			"prod": {
+				{Type: "A", Domain: "vm-1.prod.example.com.", TTL: -1, Values: []string{"192.168.0.10"}, Generated: true},
+				{Type: "A", Domain: "app.prod.example.com.", TTL: 300, Values: []string{"10.0.0.1"}},
+				{Type: "TXT", Domain: "a-app.prod.example.com.", TTL: -1, Values: []string{`"heritage=external-dns"`}},
+			},
+			"dbaas": {{Type: "A", Domain: "pg.db.example.com.", TTL: -1, Values: []string{"10.0.1.1"}}},
+			"other": {{Type: "A", Domain: "app.example.org.", TTL: -1, Values: []string{"10.0.2.1"}}},
+		},
+	)
+}
+
 func TestRecords(t *testing.T) {
 	t.Parallel()
 
-	server := getServerRecords(t)
-	defer server.Close()
+	api := recordsTestAPI(t)
+	p := newTestProvider(t, api, Config{DomainFilter: endpoint.NewDomainFilter([]string{"example.com"})}, 1)
 
-	dnsProvider, err := getDefaultTestProvider(server, getDefaultKeystoneProvider(t, 1))
+	got, err := p.Records(t.Context())
 	assert.NoError(t, err)
 
-	endpoints, err := dnsProvider.Records(context.Background())
-	assert.NoError(t, err)
-	assert.Equal(t, 2, len(endpoints))
-	assert.Equal(t, "test.com", endpoints[0].DNSName)
-	assert.Equal(t, "A", endpoints[0].RecordType)
-	assert.Equal(t, "1.2.3.4", endpoints[0].Targets[0])
-	assert.Equal(t, int64(300), int64(endpoints[0].RecordTTL))
-
-	assert.Equal(t, "test2.com", endpoints[1].DNSName)
-	assert.Equal(t, "A", endpoints[1].RecordType)
-	assert.Equal(t, "5.6.7.8", endpoints[1].Targets[0])
-	assert.Equal(t, int64(300), int64(endpoints[1].RecordTTL))
+	// The reserved zone and the zone outside the domain filter are not managed. Auto record sets are reported so
+	// that external-dns plans around them.
+	assert.ElementsMatch(t, []*endpoint.Endpoint{
+		endpoint.NewEndpoint("vm-1.prod.example.com", "A", "192.168.0.10"),
+		endpoint.NewEndpointWithTTL("app.prod.example.com", "A", 300, "10.0.0.1"),
+		endpoint.NewEndpoint("a-app.prod.example.com", "TXT", `"heritage=external-dns"`),
+	}, got)
 }
 
-// TestWrongJsonResponseRecords tests the scenario where the server returns a wrong JSON response.
-func TestWrongJsonResponseRecords(t *testing.T) {
+func TestRecordsWithoutDomainFilterSkipsOnlyReservedZones(t *testing.T) {
 	t.Parallel()
 
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
+	api := recordsTestAPI(t)
+	p := newTestProvider(t, api, Config{}, 1)
 
-	mux.HandleFunc("/zones",
-		func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"invalid:"json"`)) // This is not a valid JSON.
-		},
-	)
-	defer server.Close()
-
-	dnsProvider, err := getDefaultTestProvider(server, getDefaultKeystoneProvider(t, 1))
+	got, err := p.Records(t.Context())
 	assert.NoError(t, err)
 
-	_, err = dnsProvider.Records(context.Background())
-	assert.Error(t, err)
-}
-
-func TestEmptyZonesRouteRecords(t *testing.T) {
-	t.Parallel()
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	defer server.Close()
-
-	dnsProvider, err := getDefaultTestProvider(server, getDefaultKeystoneProvider(t, 1))
-	assert.NoError(t, err)
-
-	_, err = dnsProvider.Records(context.Background())
-	assert.Error(t, err)
-}
-
-func TestEmptyRRSetRouteRecords(t *testing.T) {
-	t.Parallel()
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	mux.HandleFunc("/zones",
-		func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-
-			zones := domains.List[domains.Zone]{
-				Count:      1,
-				NextOffset: 0,
-				Items: []*domains.Zone{{
-					ID: "1234",
-				}},
-			}
-			successResponseBytes, err := json.Marshal(zones)
-			assert.NoError(t, err)
-
-			w.WriteHeader(http.StatusOK)
-			w.Write(successResponseBytes)
-		},
-	)
-	defer server.Close()
-
-	dnsProvider, err := getDefaultTestProvider(server, getDefaultKeystoneProvider(t, 1))
-	assert.NoError(t, err)
-
-	_, err = dnsProvider.Records(context.Background())
-	fmt.Println(err)
-	assert.Error(t, err)
-}
-
-func TestZoneEndpoint500Records(t *testing.T) {
-	t.Parallel()
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	mux.HandleFunc("/zones",
-		func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-
-			w.WriteHeader(http.StatusInternalServerError)
-		},
-	)
-	defer server.Close()
-
-	dnsProvider, err := getDefaultTestProvider(server, getDefaultKeystoneProvider(t, 1))
-	assert.NoError(t, err)
-
-	_, err = dnsProvider.Records(context.Background())
-	assert.Error(t, err)
-}
-
-func TestZoneEndpoint403Records(t *testing.T) {
-	t.Parallel()
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	mux.HandleFunc("/zones",
-		func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-
-			w.WriteHeader(http.StatusForbidden)
-		},
-	)
-	defer server.Close()
-
-	dnsProvider, err := New(Config{
-		BaseURL:          server.URL,
-		DomainFilter:     endpoint.DomainFilter{},
-		KeystoneProvider: getDefaultKeystoneProvider(t, 1),
-		DryRun:           false,
-		Workers:          10,
-	}, zap.NewNop())
-	assert.NoError(t, err)
-
-	_, err = dnsProvider.Records(context.Background())
-	assert.Error(t, err)
-}
-
-func getDefaultKeystoneProvider(t *testing.T, callTimes int) KeystoneProvider {
-	t.Helper()
-	ctrl := gomock.NewController(t)
-	t.Cleanup(ctrl.Finish)
-
-	p := mock_selprovider.NewMockKeystoneProvider(ctrl)
-	p.EXPECT().GetToken().Return("test", nil).Times(callTimes)
-
-	return p
-}
-
-func getDefaultTestProvider(server *httptest.Server, keystoneProvider KeystoneProvider) (*Provider, error) {
-	dnsProvider, err := New(Config{
-		BaseURL:          server.URL,
-		KeystoneProvider: keystoneProvider,
-		DomainFilter:     endpoint.DomainFilter{},
-		DryRun:           false,
-		Workers:          1,
-	}, zap.NewNop())
-
-	return dnsProvider, err
-}
-
-func getZonesResponseRecords(t *testing.T, w http.ResponseWriter) {
-	t.Helper()
-
-	w.Header().Set("Content-Type", "application/json")
-
-	zones := domains.List[domains.Zone]{
-		Count:      2,
-		NextOffset: 0,
-		Items: []*domains.Zone{
-			{ID: "1234", Name: "test.com"},
-			{ID: "5678", Name: "test2.com"},
-		},
-	}
-	successResponseBytes, err := json.Marshal(zones)
-	assert.NoError(t, err)
-
-	w.WriteHeader(http.StatusOK)
-	w.Write(successResponseBytes)
-}
-
-func getRrsetsResponseRecords(t *testing.T, w http.ResponseWriter, domain string) {
-	t.Helper()
-
-	w.Header().Set("Content-Type", "application/json")
-
-	rrSets := domains.List[domains.RRSet]{}
-	if domain == "1234" {
-		rrSets = domains.List[domains.RRSet]{
-			Count:      1,
-			NextOffset: 0,
-			Items: []*domains.RRSet{
-				{
-					ID:   "1234",
-					Name: "test.com.",
-					Type: "A",
-					TTL:  300,
-					Records: []domains.RecordItem{
-						{Content: "1.2.3.4"},
-					},
-				},
-			},
-		}
-	}
-	if domain == "5678" {
-		rrSets = domains.List[domains.RRSet]{
-			Count:      1,
-			NextOffset: 0,
-			Items: []*domains.RRSet{
-				{
-					ID:   "5678",
-					Name: "test2.com.",
-					Type: "A",
-					TTL:  300,
-					Records: []domains.RecordItem{
-						{Content: "5.6.7.8"},
-					},
-				},
-			},
-		}
+	names := make([]string, 0, len(got))
+	for _, ep := range got {
+		names = append(names, ep.DNSName)
 	}
 
-	successResponseBytes, err := json.Marshal(rrSets)
-	assert.NoError(t, err)
-
-	w.WriteHeader(http.StatusOK)
-	w.Write(successResponseBytes)
+	assert.ElementsMatch(t, []string{
+		"vm-1.prod.example.com", "app.prod.example.com", "a-app.prod.example.com", "app.example.org",
+	}, names)
 }
 
-func getServerRecords(t *testing.T) *httptest.Server {
-	t.Helper()
+func TestRecordsErrors(t *testing.T) {
+	t.Parallel()
 
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
+	t.Run("zones request fails", func(t *testing.T) {
+		t.Parallel()
 
-	mux.HandleFunc("/zones", func(w http.ResponseWriter, r *http.Request) {
-		getZonesResponseRecords(t, w)
-	})
-	mux.HandleFunc("/zones/1234/rrset", func(w http.ResponseWriter, r *http.Request) {
-		getRrsetsResponseRecords(t, w, "1234")
-	})
-	mux.HandleFunc("/zones/5678/rrset", func(w http.ResponseWriter, r *http.Request) {
-		getRrsetsResponseRecords(t, w, "5678")
+		api := recordsTestAPI(t)
+		api.zonesStatus = http.StatusForbidden
+		p := newTestProvider(t, api, Config{}, 1)
+
+		_, err := p.Records(t.Context())
+		assert.ErrorContains(t, err, "list zones")
 	})
 
-	return server
+	t.Run("record sets request fails", func(t *testing.T) {
+		t.Parallel()
+
+		api := recordsTestAPI(t)
+		api.recordsStatus = http.StatusInternalServerError
+		p := newTestProvider(t, api, Config{}, 1)
+
+		_, err := p.Records(t.Context())
+		assert.ErrorContains(t, err, "list record sets of zone")
+	})
+
+	t.Run("keystone token cannot be issued", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		keystone := mock_selprovider.NewMockKeystoneProvider(ctrl)
+		keystone.EXPECT().GetToken().Return("", errors.New("authorization failed")).Times(1)
+
+		p, err := New(Config{BaseURL: "http://127.0.0.1:1", KeystoneProvider: keystone}, zap.NewNop())
+		assert.NoError(t, err)
+
+		_, err = p.Records(t.Context())
+		assert.ErrorContains(t, err, "authorization failed")
+	})
 }

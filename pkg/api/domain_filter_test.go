@@ -6,10 +6,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/ad35cm/external-dns-selectel-private-webhook/pkg/api"
+	mock_provider "github.com/ad35cm/external-dns-selectel-private-webhook/pkg/api/mock"
 	"github.com/goccy/go-json"
 	"github.com/gofiber/fiber/v2"
-	"github.com/selectel/external-dns-selectel-webhook/pkg/api"
-	mock_provider "github.com/selectel/external-dns-selectel-webhook/pkg/api/mock"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 	"go.uber.org/zap"
@@ -25,7 +25,7 @@ func TestWebhook_DomainFilter(t *testing.T) {
 	mockLogger := zap.NewNop()
 	mockProvider := mock_provider.NewMockProvider(ctrl)
 	mockMetricsCollector := getTestMockMetricsCollector(ctrl)
-	expectedDomainFilter := endpoint.DomainFilter{Filters: []string{"test"}}
+	expectedDomainFilter := endpoint.NewDomainFilter([]string{"prod-ru-6.burnsdev.com"})
 
 	app := api.New(mockLogger, mockMetricsCollector, mockProvider)
 	mockProvider.EXPECT().
@@ -43,5 +43,5 @@ func TestWebhook_DomainFilter(t *testing.T) {
 	var domainFilterResponse endpoint.DomainFilter
 	err = json.NewDecoder(resp.Body).Decode(&domainFilterResponse)
 	assert.NoError(t, err)
-	assert.Equal(t, expectedDomainFilter, domainFilterResponse)
+	assert.Equal(t, expectedDomainFilter, &domainFilterResponse)
 }

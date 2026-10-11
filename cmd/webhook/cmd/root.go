@@ -1,14 +1,17 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net"
+	"regexp"
 	"strings"
 
-	"github.com/selectel/external-dns-selectel-webhook/internal/selprovider"
-	"github.com/selectel/external-dns-selectel-webhook/pkg/api"
-	"github.com/selectel/external-dns-selectel-webhook/pkg/keystone"
-	"github.com/selectel/external-dns-selectel-webhook/pkg/metrics"
+	"github.com/ad35cm/external-dns-selectel-private-webhook/internal/selprovider"
+	"github.com/ad35cm/external-dns-selectel-private-webhook/pkg/api"
+	"github.com/ad35cm/external-dns-selectel-private-webhook/pkg/keystone"
+	"github.com/ad35cm/external-dns-selectel-private-webhook/pkg/metrics"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -24,6 +27,8 @@ var (
 	password         string
 	projectID        string
 	apiPort          string
+	healthPort       string
+	pool             string
 	baseURL          string
 	worker           int
 	domainFilter     []string
@@ -34,15 +39,29 @@ var (
 const (
 	// DefaultAuthURL represents default endpoint where keystone-token should be retrieved.
 	DefaultAuthURL = "https://cloud.api.selcloud.ru/identity/v3"
-	// DefaultDomainsURL represents default endpoint of Selectel DNS API.
-	DefaultDomainsURL = "https://api.selectel.ru/domains/v2"
+	// PrivateDNSURLTemplate builds the Private DNS API endpoint of a pool.
+	PrivateDNSURLTemplate = "https://%s.cloud.api.selcloud.ru/private-dns/v1"
+	// webhookHost keeps the webhook API reachable from the external-dns container of the same pod only.
+	webhookHost = "127.0.0.1"
 )
 
+var poolPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
 var rootCmd = &cobra.Command{
-	Use:   "external-dns-selectel-webhook",
-	Short: "provider webhook for the Selectel DNS service",
-	Long:  "provider webhook for the Selectel DNS service",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:          "external-dns-selectel-private-webhook",
+	Short:        "provider webhook for the Selectel Private DNS service",
+	Long:         "provider webhook for the Selectel Private DNS service",
+	SilenceUsage: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		privateDNSURL, err := getPrivateDNSURL()
+		if err != nil {
+			return err
+		}
+
+		if err := validateCredentials(); err != nil {
+			return err
+		}
+
 		logger := getLogger()
 		defer func(logger *zap.Logger) {
 			err := logger.Sync()
@@ -51,7 +70,13 @@ var rootCmd = &cobra.Command{
 			}
 		}(logger)
 
-		endpointDomainFilter := endpoint.DomainFilter{Filters: domainFilter}
+		logger.Info(
+			"starting external-dns-selectel-private-webhook",
+			zap.String("version", cmd.Root().Version),
+			zap.String("private_dns_url", privateDNSURL),
+			zap.Strings("domain_filter", domainFilter),
+			zap.Bool("dry_run", dryRun),
+		)
 
 		keystoneProvider := keystone.NewProvider(logger, keystone.Credentials{
 			IdentityEndpoint: authorizationURL,
@@ -62,22 +87,68 @@ var rootCmd = &cobra.Command{
 		})
 
 		selProvider, err := selprovider.New(selprovider.Config{
-			BaseURL:          baseURL,
+			BaseURL:          privateDNSURL,
 			KeystoneProvider: keystoneProvider,
-			DomainFilter:     endpointDomainFilter,
+			DomainFilter:     endpoint.NewDomainFilter(domainFilter),
 			DryRun:           dryRun,
 			Workers:          worker,
 		}, logger.With(zap.String("component", "selprovider")))
 		if err != nil {
-			panic(err)
+			return err
 		}
 
 		app := api.New(logger.With(zap.String("component", "api")), metrics.NewHttpApiMetrics(), selProvider)
-		err = app.Listen(apiPort)
-		if err != nil {
-			panic(err)
-		}
+
+		return app.Listen(net.JoinHostPort(webhookHost, apiPort), net.JoinHostPort("", healthPort))
 	},
+}
+
+// getPrivateDNSURL returns --base-url when set, otherwise the endpoint of --pool.
+func getPrivateDNSURL() (string, error) {
+	if baseURL != "" {
+		return strings.TrimSuffix(baseURL, "/"), nil
+	}
+
+	if pool == "" {
+		return "", errors.New("either --pool/POOL or --base-url/BASE_URL must be set")
+	}
+
+	if !poolPattern.MatchString(pool) {
+		return "", fmt.Errorf("invalid pool %q, expected a pool name such as ru-6", pool)
+	}
+
+	return fmt.Sprintf(PrivateDNSURLTemplate, pool), nil
+}
+
+// validateCredentials fails fast when the Keystone credentials are incomplete.
+func validateCredentials() error {
+	required := []struct {
+		flag  string
+		value string
+	}{
+		{"project-id", projectID},
+		{"account-id", accountID},
+		{"username", username},
+		{"password", password},
+	}
+
+	var missing []string
+
+	for _, r := range required {
+		if r.value == "" {
+			missing = append(missing, "--"+r.flag+"/"+envName(r.flag))
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required configuration: %s", strings.Join(missing, ", "))
+	}
+
+	return nil
+}
+
+func envName(flag string) string {
+	return strings.ToUpper(strings.ReplaceAll(flag, "-", "_"))
 }
 
 func getLogger() *zap.Logger {
@@ -113,25 +184,34 @@ func getZapLogLevel() zapcore.Level {
 	}
 }
 
-func Execute() error {
+// Execute runs the webhook. version is reported by --version and in the startup log.
+func Execute(version string) error {
+	rootCmd.Version = version
+
 	return rootCmd.Execute()
 }
 
 func init() {
 	cobra.OnInitialize(initConfig)
 
-	rootCmd.PersistentFlags().StringVar(&apiPort, "api-port", "8888", "Specifies the port to listen on.")
-	rootCmd.PersistentFlags().StringVar(&baseURL, "base-url", DefaultDomainsURL, "Identifies the Base URL for utilizing the API.")
+	rootCmd.PersistentFlags().StringVar(&apiPort, "api-port", "8888", "Specifies the port of the webhook API. "+
+		"It listens on 127.0.0.1 only, external-dns calls it from the same pod.")
+	rootCmd.PersistentFlags().StringVar(&healthPort, "health-port", "8080", "Specifies the port of the "+
+		"/healthz and /metrics endpoints. It listens on all interfaces.")
+	rootCmd.PersistentFlags().StringVar(&pool, "pool", "", "Specifies the Selectel pool of the private zones, "+
+		"e.g. ru-6. The API endpoint is https://<pool>.cloud.api.selcloud.ru/private-dns/v1.")
+	rootCmd.PersistentFlags().StringVar(&baseURL, "base-url", "", "Overrides the Private DNS API endpoint "+
+		"derived from --pool.")
 	rootCmd.PersistentFlags().StringVar(&projectID, "project-id", "", "Specifies the project id to authorize.")
 	rootCmd.PersistentFlags().StringVar(&accountID, "account-id", "", "Specifies the account id to authorize.")
 	rootCmd.PersistentFlags().StringVar(&authorizationURL, "auth-url", DefaultAuthURL, "Identifies the URL for utilizing the API to receive keystone-token.")
 	rootCmd.PersistentFlags().StringVar(&username, "username", "", "Specifies the username of service user to authorize.")
 	rootCmd.PersistentFlags().StringVar(&password, "password", "", "Specifies the password of service user to authorize.")
 	rootCmd.PersistentFlags().IntVar(&worker, "worker", 10, "Specifies the number "+
-		"of workers to employ for querying the API. Given that we need to iterate over all zones and "+
-		"records, it can be parallelized. However, it is important to avoid setting this number "+
+		"of zones processed concurrently. It is important to avoid setting this number "+
 		"excessively high to prevent receiving 429 rate limiting from the API.")
-	rootCmd.PersistentFlags().StringArrayVar(&domainFilter, "domain-filter", []string{}, "Establishes a filter for DNS zone names.")
+	rootCmd.PersistentFlags().StringSliceVar(&domainFilter, "domain-filter", []string{}, "Establishes a filter for "+
+		"DNS zone names. Repeat the flag or separate domains with commas.")
 	rootCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Specifies whether to perform a dry run.")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Specifies the log level. Possible values are: debug, info, warn, error.")
 }

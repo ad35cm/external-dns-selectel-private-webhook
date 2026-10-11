@@ -1,13 +1,7 @@
-GOLANGCI_VERSION = 1.62.2
+GOLANGCI_VERSION = 2.14.0
 LICENCES_IGNORE_LIST = $(shell cat licenses/licenses-ignore-list.txt)
 
-VERSION ?= 0.0.1
-IMAGE_TAG_BASE ?= selectel/external-dns-selectel-webhook
-IMG ?= $(IMAGE_TAG_BASE):$(VERSION)
-
-BUILD_VERSION ?= $(shell git branch --show-current)
-BUILD_COMMIT ?= $(shell git rev-parse --short HEAD)
-BUILD_TIMESTAMP ?= $(shell date -u '+%Y-%m-%d %H:%M:%S')
+BINARY = external-dns-selectel-private-webhook
 
 PWD = $(shell pwd)
 export PATH := $(PWD)/bin:$(PATH)
@@ -17,11 +11,7 @@ download:
 
 .PHONY: build
 build:
-	CGO_ENABLED=0 go build -ldflags "-s -w" -o ./bin/external-dns-selectel-webhook -v cmd/webhook/main.go
-
-.PHONY: docker-build
-docker-build:
-	docker build -t $(IMG) -f Dockerfile .
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ./bin/$(BINARY) -v ./cmd/webhook
 
 test:
 	go test -race ./...
@@ -31,7 +21,7 @@ mocks:
 
 GOLANGCI_LINT = bin/golangci-lint-$(GOLANGCI_VERSION)
 $(GOLANGCI_LINT):
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | bash -s -- -b bin v$(GOLANGCI_VERSION)
+	curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b bin v$(GOLANGCI_VERSION)
 	@mv bin/golangci-lint "$(@)"
 
 lint: $(GOLANGCI_LINT) download
@@ -54,20 +44,22 @@ out/report.json:
 	go test -race ./... -coverprofile=out/cover.out --json | tee "$(@)"
 
 run:
-	go run cmd/webhook
+	go run ./cmd/webhook
 
 .PHONY: clean
 clean:
 	rm -rf ./bin
 	rm -rf ./out
+	rm -rf ./dist
 
 GO_RELEASER = bin/goreleaser
 $(GO_RELEASER):
-	GOBIN=$(PWD)/bin go install github.com/goreleaser/goreleaser@latest
+	GOBIN=$(PWD)/bin go install github.com/goreleaser/goreleaser/v2@latest
 
 .PHONY: release-check
-release-check: $(GO_RELEASER) ## Check if the release will work
-	GITHUB_SERVER_URL=github.com GITHUB_REPOSITORY=selectel/external-dns-selectel-webhook REGISTRY=$(REGISTRY) IMAGE_NAME=$(IMAGE_NAME) $(GO_RELEASER) release --snapshot --clean --skip-publish
+release-check: $(GO_RELEASER) ## Build binaries and both image architectures locally without publishing
+	$(GO_RELEASER) check
+	$(GO_RELEASER) release --snapshot --clean --skip=publish
 
 GO_LICENSES = bin/go-licenses
 $(GO_LICENSES):

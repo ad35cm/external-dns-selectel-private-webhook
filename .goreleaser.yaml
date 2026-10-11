@@ -1,0 +1,87 @@
+version: 2
+project_name: external-dns-selectel-private-webhook
+before:
+  hooks:
+    - go mod tidy
+    - go mod download
+
+builds:
+  - id: external-dns-selectel-private-webhook
+    dir: .
+    main: ./cmd/webhook/
+    binary: external-dns-selectel-private-webhook
+    env:
+      - CGO_ENABLED=0 # build a static binary without C dependencies
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .ShortCommit }}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+dockers:
+  - ids:
+      - external-dns-selectel-private-webhook
+    image_templates:
+      - ghcr.io/ad35cm/{{ .ProjectName }}:{{ .Version }}-amd64
+    goos: linux
+    goarch: amd64
+    dockerfile: goreleaser.dockerfile
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.description=ExternalDNS webhook provider for Selectel Private DNS"
+      - "--label=org.opencontainers.image.source=https://github.com/ad35cm/external-dns-selectel-private-webhook"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+    use: buildx
+  - ids:
+      - external-dns-selectel-private-webhook
+    image_templates:
+      - ghcr.io/ad35cm/{{ .ProjectName }}:{{ .Version }}-arm64
+    goos: linux
+    goarch: arm64
+    dockerfile: goreleaser.dockerfile
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.description=ExternalDNS webhook provider for Selectel Private DNS"
+      - "--label=org.opencontainers.image.source=https://github.com/ad35cm/external-dns-selectel-private-webhook"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+    use: buildx
+
+docker_manifests:
+  - name_template: "ghcr.io/ad35cm/{{ .ProjectName }}:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/ad35cm/{{ .ProjectName }}:{{ .Version }}-amd64"
+      - "ghcr.io/ad35cm/{{ .ProjectName }}:{{ .Version }}-arm64"
+
+archives:
+  - name_template: "{{ .ProjectName }}-{{ .Version }}.{{ .Os }}-{{ .Arch }}"
+    formats:
+      - tar.gz
+    wrap_in_directory: true
+
+checksum:
+  name_template: "{{ .ProjectName }}-{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+# Configuration for GitHub Releases
+release:
+  github:
+    owner: ad35cm
+    name: external-dns-selectel-private-webhook
+  footer: |
+    ## Docker Images
+    - ghcr.io/ad35cm/external-dns-selectel-private-webhook:{{ trimprefix .Tag "v" }} (universal, multi-platform)
+    - ghcr.io/ad35cm/external-dns-selectel-private-webhook:{{ trimprefix .Tag "v" }}-amd64
+    - ghcr.io/ad35cm/external-dns-selectel-private-webhook:{{ trimprefix .Tag "v" }}-arm64
+  prerelease: auto
+  replace_existing_draft: true
